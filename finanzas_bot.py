@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import json
 
-TOKEN = "8383987370:AAE8OiZUWdTPflNqFktBHAYXBOySPFyRVz4"
+TOKEN = "TOKEN"
 CSV_FILE = "movimientos.csv"
 
 MAPA_SOBRES = {
@@ -395,3 +395,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
