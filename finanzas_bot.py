@@ -1,398 +1,338 @@
-import csv
 import os
-from datetime import datetime
+import json
+from openai import OpenAI
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import json
+from datetime import date
+from analizador_bbva import obtener_uso_bbva_desde_corte
+from bbva_estado import construir_estado_bbva
+from parser_edc import parsear_edc_texto
+from edc import registrar_edc, obtener_edc_activo
+from clasificador_gastos import resumir_gastos
+from ia_contexto import construir_input_ia
+from calculos import calcular_efectivo
+hoy = date.today().isoformat()
+from storage import init_csv, guardar_movimiento, leer_movimientos
+from calculos import (
+    calcular_totales,
+    calcular_saldos_por_cuenta,
+    evaluar_sobres_mensuales,
+    calcular_tarjeta_bbva,
+    calcular_tarjeta_plata
+)
+from resumen import resumen_completo
 
-TOKEN = "TOKEN"
-CSV_FILE = "movimientos.csv"
-
-MAPA_SOBRES = {
-    "ahorro": "ahorro_personal",
-    "ahorro_personal": "ahorro_personal",
-    "mama": "mama",
-    "mamá": "mama",
-    "pension": "pension",
-    "carro": "carro",
-    "gasolina": "gasolina",
-    "efectivo": "efectivo"
-}
-
-NOMBRES_AMIGABLES = {
-    "ahorro_personal": "Ahorro Personal",
-    "mama": "Mamá",
-    "carro": "Carro",
-    "pension": "Pensión",
-    "efectivo": "Efectivo",
-    "gasolina": "Gasolina",
-    "azteca": "banco_azteca",
-    "bancoppel": "banco_bancoppel"
-}
-
-MAPA_CUENTAS = {
-    "azteca": "banco_azteca",
-    "banco_azteca": "banco_azteca",
-    "bancoppel": "banco_bancoppel",
-    "banco_bancoppel": "banco_bancoppel"
-}
+# 🔐 Cargar llaves
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+if not TOKEN:
+    raise ValueError("❌ No se encontró TELEGRAM_TOKEN en .env")
 
-def init_csv():
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['fecha', 'tipo', 'monto', 'categoria', 'cuenta'])
+# 📂 Cargar configuración financiera
+with open("config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
 
-def guardar_movimiento(tipo, monto, categoria, cuenta):
-    fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def fecha_ultimo_corte_bbva(hoy=None):
+    hoy = hoy or date.today()
 
-    # Normaliza el nombre de la cuenta y categoría
-    categoria = MAPA_SOBRES.get(categoria, categoria)
-    cuenta = MAPA_SOBRES.get(cuenta, cuenta)
-
-    with open(CSV_FILE, mode='a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([fecha, tipo, monto, categoria, cuenta])
-
-def parse_monto(text):
-    try:
-        return float(text)
-    except ValueError:
-        return None
+    if hoy.day >= 7:
+        return date(hoy.year, hoy.month, 7)
+    else:
+        if hoy.month == 1:
+            return date(hoy.year - 1, 12, 7)
+        return date(hoy.year, hoy.month - 1, 7)
     
 
-def generar_resumen_diario():
-    hoy = datetime.now().date()
-    total_gastos = 0.0
-    total_ingresos = 0.0
+# 🤖 Comando /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Bot financiero activo")
 
-    sobres_interes = ['gasolina', 'pension', 'carro', 'mama', 'ahorro_personal']
-    saldos_sobres = {sobre: 0.0 for sobre in sobres_interes}
-    saldo_general_cuentas = {}
+# 💰 Ingreso
+async def ingreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        monto = float(context.args[0])
+        categoria = context.args[1].lower()
+        cuenta = context.args[2].lower() if len(context.args) > 2 else "efectivo"
 
-    if not os.path.exists(CSV_FILE):
-        return "No hay movimientos registrados aún."
+        guardar_movimiento("ingreso", monto, categoria, cuenta)
+        await update.message.reply_text("✅ Ingreso registrado")
 
-    with open(CSV_FILE, mode='r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            fecha = datetime.strptime(row['fecha'], "%Y-%m-%d %H:%M:%S").date()
-            monto = float(row['monto'])
-            tipo = row['tipo']
-            categoria = row['categoria'].lower()
-            cuenta = row['cuenta'].lower()
+    except Exception:
+        await update.message.reply_text(
+            "Uso correcto:\n/ingreso monto categoria [cuenta]"
+        )
 
-            # Normaliza el nombre del sobre o cuenta usando MAPA_SOBRES o MAPA_CUENTAS
-            cuenta = MAPA_SOBRES.get(cuenta, cuenta)  # Primero mira en sobres
-            cuenta = MAPA_CUENTAS.get(cuenta, cuenta)  # Luego mira en cuentas
+# 💸 Gasto
+async def gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        monto = float(context.args[0])
+        categoria = context.args[1].lower()
+        cuenta = context.args[2].lower() if len(context.args) > 2 else "efectivo"
 
-            # Para resumen diario:
-            if fecha == hoy:
-                if tipo in ['gasto', 'pago']:
-                    total_gastos += monto
-                elif tipo == 'ingreso':
-                    total_ingresos += monto
+        guardar_movimiento("gasto", monto, categoria, cuenta)
+        await update.message.reply_text("✅ Gasto registrado")
 
-            # Para calcular saldo por sobre (acumulativo sin importar fecha)
-            if cuenta in sobres_interes:
-                if tipo == 'ingreso':
-                    saldos_sobres[cuenta] += monto
-                elif tipo in ['gasto', 'pago']:
-                    saldos_sobres[cuenta] -= monto
+    except Exception:
+        await update.message.reply_text(
+            "Uso correcto:\n/gasto monto categoria [cuenta]"
+        )
 
-            # Saldo general por cuenta (efectivo, banco, etc)
-            if cuenta not in saldo_general_cuentas:
-                saldo_general_cuentas[cuenta] = 0.0
+# 💳 Pago
+async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        monto = float(context.args[0])
+        categoria = context.args[1].lower()
+        cuenta = context.args[2].lower() if len(context.args) > 2 else "efectivo"
 
-            if tipo == 'ingreso':
-                saldo_general_cuentas[cuenta] += monto
-            elif tipo in ['gasto', 'pago']:
-                saldo_general_cuentas[cuenta] -= monto
+        guardar_movimiento("pago", monto, categoria, cuenta)
+        await update.message.reply_text("✅ Pago registrado")
 
-    mensaje = (
-        f"📅 Resumen financiero de hoy ({hoy}):\n"
-        f"💸 Gastos totales: ${total_gastos:.2f}\n"
-        f"💰 Ingresos totales: ${total_ingresos:.2f}\n"
-        f"🔢 Balance: ${total_ingresos - total_gastos:.2f}\n\n"
-        "📦 Saldos actuales en sobres:\n"
+    except Exception:
+        await update.message.reply_text(
+            "Uso correcto:\n/pago monto categoria [cuenta]"
+        )
+
+# 📊 Resumen
+async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    movs = leer_movimientos()
+
+    totales = calcular_totales(movs)
+    saldos = calcular_saldos_por_cuenta(movs)
+    sobres = evaluar_sobres_mensuales(
+        movs, CONFIG["sobres_mensuales"]
     )
 
-    for sobre, saldo in saldos_sobres.items():
-        nombre_mostrar = NOMBRES_AMIGABLES.get(sobre, sobre.title().replace("_", " "))
-        mensaje += f"- {nombre_mostrar}: ${saldo:.2f}\n"
+    # 🔹 NUEVO MODELO BBVA
+    edc_bbva = obtener_edc_activo("bbva")
+    uso_bbva = obtener_uso_bbva_desde_corte()
 
-    mensaje += "\n🏦 Saldo general por cuentas:\n"
-    for cuenta, saldo in saldo_general_cuentas.items():
-        nombre_mostrar = NOMBRES_AMIGABLES.get(cuenta, cuenta.title().replace("_", " "))
-        mensaje += f"- {nombre_mostrar}: ${saldo:.2f}\n"
+    # PLATA se queda igual por ahora
+    plata = calcular_tarjeta_plata(
+        movs, CONFIG["tarjetas"]["plata"]
+    )
 
-    return mensaje
+    texto = resumen_completo(
+        totales,
+        saldos,
+        sobres,
+        edc_bbva,
+        uso_bbva,
+        plata
+    )
 
-
-
-# --- Handlers (responden a comandos) ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hola! Estoy activo y listo para ayudarte.")
-
-async def gasto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: /gasto monto categoria [cuenta]")
-        return
-    monto = parse_monto(context.args[0])
-    if monto is None:
-        await update.message.reply_text("Monto inválido.")
-        return
-    
-    categoria = context.args[1].lower()
-    cuenta = context.args[2].lower() if len(context.args) >= 3 else "efectivo"
-    
-    guardar_movimiento("gasto", monto, categoria, cuenta)
-    await update.message.reply_text(f"Gasto registrado: ${monto} en {categoria} ({cuenta})")
-
-async def ingreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: /ingreso monto categoria [cuenta]")
-        return
-    monto = parse_monto(context.args[0])
-    if monto is None:
-        await update.message.reply_text("Monto inválido.")
-        return
-    categoria = context.args[1].lower()
-    cuenta = context.args[2].lower() if len(context.args) >= 3 else "efectivo"
-    guardar_movimiento("ingreso", monto, categoria, cuenta)
-    await update.message.reply_text(f"Ingreso registrado: ${monto} en {categoria} ({cuenta})")
-
-async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: /pago monto cuenta")
-        return
-    monto = parse_monto(context.args[0])
-    if monto is None:
-        await update.message.reply_text("Monto inválido.")
-        return
-    cuenta = context.args[1].lower()
-    guardar_movimiento("pago", monto, "pago_tarjeta", cuenta)
-    await update.message.reply_text(f"Pago registrado: ${monto} a {cuenta}")
+    await update.message.reply_text(texto)
 
 
-async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensaje = generar_resumen_diario()
-    await update.message.reply_text(mensaje)
+async def movimientos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    movs = leer_movimientos()
 
-# === Análisis inteligente ===
-
-def cargar_config():
-    with open("config.json", "r") as f:
-        return json.load(f)
-
-def calcular_saldos_actuales():
-    """
-    Lee los movimientos y suma el saldo actual de cada sobre/cuenta.
-    Retorna un dict: { "carro": saldo, "pension": saldo, ... }
-    """
-    saldos = {}
-    if not os.path.exists(CSV_FILE):
-        return saldos
-
-    with open(CSV_FILE, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            cuenta = row['cuenta'].lower()
-            monto = float(row['monto'])
-            tipo = row['tipo']
-            # Inicializa saldo si no existe
-            if cuenta not in saldos:
-                saldos[cuenta] = 0.0
-
-            if tipo == 'ingreso':
-                saldos[cuenta] += monto
-            elif tipo in ['gasto', 'pago']:
-                saldos[cuenta] -= monto
-    return saldos
-
-
-
-def generar_consejos_financieros():
-    config = cargar_config()
-    hoy = datetime.now()
-    consejos = []
-
-    saldos = calcular_saldos_actuales()
-    sobres = config.get("sobres", {})
-    tarjetas = config.get("tarjetas", {})
-    
-    # Checar prioridades y metas
-    for sobre, datos in sobres.items():
-        saldo_actual = saldos.get(sobre, 0.0)
-        meta = datos.get("meta", 0)
-        prioridad = datos.get("prioridad", 99)
-        deuda = datos.get("deuda", False)
-
-        # Si hay deuda (ej. mamá)
-        if deuda and saldo_actual < meta:
-            faltante = meta - saldo_actual
-            consejos.append(f"🔴 Aún debes ${faltante:.2f} a {sobre}. Prioriza abonar a esta deuda.")
-
-        # Si no hay deuda, chequea si el saldo es suficiente para meta
-        elif saldo_actual < meta:
-            faltante = meta - saldo_actual
-            consejos.append(f"📌 Te faltan ${faltante:.2f} para cubrir la meta de {sobre}. Considera abonar esa cantidad.")
-
-        else:
-            consejos.append(f"✅ {sobre.title()} está cubierto con ${saldo_actual:.2f}.")
-
-    # Revisión de tarjeta platacard y deuda actual
-    if "platacard" in tarjetas:
-        deuda_actual = tarjetas["platacard"].get("deuda_actual", 0)
-
-        cuentas_posibles = ["efectivo", "azteca", "bancoppel", "platacard"]
-        saldo_disponible_para_tarjeta = sum(saldos.get(cuenta, 0) for cuenta in cuentas_posibles)
-
-        if deuda_actual > 0:
-            if saldo_disponible_para_tarjeta >= deuda_actual:
-                consejos.append(f"💳 Puedes pagar la deuda completa de Platacard (${deuda_actual:.2f}) con el saldo actual.")
-            elif saldo_disponible_para_tarjeta > 0:
-                faltante = deuda_actual - saldo_disponible_para_tarjeta
-                consejos.append(f"⚠️ Solo tienes ${saldo_disponible_para_tarjeta:.2f} para abonar a Platacard. Aún debes ${faltante:.2f}.")
-            else:
-                consejos.append(f"⚠️ No tienes saldo disponible para abonar a la deuda de Platacard (${deuda_actual:.2f}).")
-
-    # Opcional: muestra saldo libre en efectivo
-    saldo_efectivo = saldos.get("efectivo", 0)
-    if saldo_efectivo > 0:
-        consejos.append(f"💵 Tienes ${saldo_efectivo:.2f} libre en efectivo para gastos o ahorro adicional.")
-
-    if not consejos:
-        return "✅ Todo en orden por ahora. Buen manejo financiero."
-
-    return "🧠 Consejos financieros de hoy:\n\n" + "\n".join(consejos)
-
-
-
-async def consejo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensaje = generar_consejos_financieros()
-    await update.message.reply_text(mensaje)
-
-
-async def listar_movimientos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(CSV_FILE):
+    if not movs:
         await update.message.reply_text("No hay movimientos registrados.")
         return
 
-    with open(CSV_FILE, mode='r') as f:
-        reader = list(csv.DictReader(f))
-        print("DEBUG: Movimientos leídos:", reader)  # imprime los datos leídos
-        ultimos = reader[-5:]
-        print("DEBUG: Últimos movimientos:", ultimos)
-        if not ultimos:
-            await update.message.reply_text("No hay movimientos recientes.")
-            return
+    ultimos = movs[-5:]
 
-        mensaje = "🧾 Últimos movimientos:\n"
-        for i, row in enumerate(ultimos, start=1):
-            mensaje += (
-                f"{i}. {row.get('fecha', '')} - {row.get('tipo', '')} - ${row.get('monto', '')} - "
-                f"{row.get('categoria', '')} - {row.get('cuenta', '')}\n"
-            )
-        mensaje += "\nUsa /borrar [número] para eliminar alguno."
-        await update.message.reply_text(mensaje)
+    mensaje = "🧾 Últimos movimientos:\n"
+    for i, m in enumerate(ultimos, start=1):
+        mensaje += (
+            f"{i}. {m['fecha']} | {m['tipo']} | "
+            f"${m['monto']} | {m['categoria']} | {m['cuenta']}\n"
+        )
 
-
+    mensaje += "\nUsa /borrar N para eliminar uno (ej. /borrar 2)"
+    await update.message.reply_text(mensaje)
 
 async def borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.message.reply_text("Uso: /borrar número_del_movimiento (ej. /borrar 2)")
+        await update.message.reply_text("Uso: /borrar N (ej. /borrar 2)")
         return
 
     try:
-        index = int(context.args[0]) - 1  # convertir a índice 0-based
+        n = int(context.args[0])
+        if n < 1 or n > 5:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Debes escribir un número válido.")
+        await update.message.reply_text("Debes indicar un número del 1 al 5.")
         return
 
-    if not os.path.exists(CSV_FILE):
-        await update.message.reply_text("No hay movimientos registrados.")
+    movs = leer_movimientos()
+
+    if len(movs) < n:
+        await update.message.reply_text("No hay tantos movimientos.")
         return
 
-    # Leemos el archivo CSV completo
-    with open(CSV_FILE, mode='r', newline='') as f:
-        reader = list(csv.reader(f))
-        encabezado = reader[0]
-        datos = reader[1:]
+    indice_real = len(movs) - 5 + (n - 1)
+    indice_real = max(indice_real, 0)
 
-    ultimos = datos[-5:]  # últimos 5 movimientos
+    try:
+        from storage import borrar_movimiento
+        borrar_movimiento(indice_real)
+        await update.message.reply_text("🗑️ Movimiento eliminado correctamente.")
+    except Exception as e:
+        await update.message.reply_text(f"Error al borrar: {e}")
 
-    if index < 0 or index >= len(ultimos):
-        await update.message.reply_text(f"Número fuera de rango. Solo puedes borrar entre los últimos {len(ultimos)} movimientos.")
-        return
+async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    # Calcula el índice real en la lista completa de datos
-    indice_real = len(datos) - len(ultimos) + index
+    try:
+        movs = leer_movimientos()
 
-    # Elimina el movimiento seleccionado
-    del datos[indice_real]
+        sobres = evaluar_sobres_mensuales(
+            movs, CONFIG["sobres_mensuales"]
+        )
 
-    # Reescribe el archivo CSV con los datos actualizados
-    with open(CSV_FILE, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(encabezado)
-        writer.writerows(datos)
+        bbva = construir_estado_bbva()
+        efectivo = calcular_efectivo(movs)
 
-    await update.message.reply_text("✅ Movimiento eliminado correctamente.")
+        resumen_gastos = resumir_gastos(movs)
 
+        contexto_ia = construir_input_ia(
+            sobres=sobres,
+            bbva=bbva,
+            efectivo=efectivo,
+            resumen_gastos=resumen_gastos,
+            periodo="2026-01-01 a 2026-01-10"
+        )
 
+        prompt = f"""
+Eres un asistente financiero personal.
+
+Recibirás un contexto financiero YA CALCULADO.
+NO calcules nada.
+NO infieras datos.
+NO inventes objetivos.
+
+Tu tarea:
+- Proponer MÁXIMO 5 acciones concretas.
+- Cada acción debe incluir un monto ($), fecha o porcentaje.
+- Prioriza riesgos y fechas próximas.
+- Si no hay riesgos, dilo explícitamente.
+
+Reglas:
+- No sugieras eliminar sobres.
+- No propongas acciones imposibles.
+- Usa frases cortas y directas.
+
+Contexto:
+{contexto_ia}
+"""
+
+        respuesta = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Eres un asesor financiero experto."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.6
+        )
+
+        await update.message.reply_text(
+            respuesta.choices[0].message.content
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"Error al consultar IA: {e}"
+        )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensaje = (
-        "📋 *Menú de comandos disponibles:*\n\n"
-        "💰 *Ingresos y Gastos:*\n"
-        "• `/ingreso monto categoria [cuenta]` – Registrar un ingreso\n"
-        "   Ej: `/ingreso 500 salario efectivo`\n"
-        "• `/gasto monto categoria [cuenta]` – Registrar un gasto\n"
-        "   Ej: `/gasto 120 gasolina carro`\n"
-        "• `/pago monto cuenta` – Registrar pago de tarjeta u otro gasto especial\n"
-        "   Ej: `/pago 300 platacard`\n\n"
-        "📊 *Resumen y seguimiento:*\n"
-        "• `/resumen` – Ver resumen diario de ingresos, gastos y saldos\n"
-        "• `/consejo` – Recomendaciones financieras inteligentes\n"
-        "• `/movimientos` – Ver los últimos 5 movimientos\n"
-        "• `/borrar [número]` – Eliminar un movimiento reciente\n"
-        "   Ej: `/borrar 2`\n\n"
-        "📦 *Cuentas y sobres reconocidos:*\n"
-        "`carro`, `pension`, `mama`, `ahorro`, `efectivo`, `bancoppel`, `azteca`, etc.\n"
-        "_(Alias como 'ahorro' → 'ahorro_personal' están mapeados)_\n\n"
-        "🆘 *Otros:*\n"
+    texto = (
+        "📋 *Menú de comandos disponibles*\n\n"
+        "💰 *Ingresos y gastos*\n"
+        "• `/ingreso monto categoria [cuenta]`\n"
+        "  Ej: `/ingreso 4300 trabajo efectivo`\n\n"
+        "• `/gasto monto categoria [cuenta]`\n"
+        "  Ej: `/gasto 300 gasolina efectivo`\n\n"
+        "• `/pago monto categoria [cuenta]`\n"
+        "  Ej: `/pago 2000 carro efectivo`\n\n"
+        "📊 *Consultas*\n"
+        "• `/resumen` – Ver resumen financiero completo\n"
+        "• `/movimientos` – Ver los últimos 5 movimientos\n\n"
+        "🗑️ *Correcciones*\n"
+        "• `/borrar N` – Borrar un movimiento (1–5)\n"
+        "  Ej: `/borrar 2`\n\n"
+        "🤖 *Inteligencia artificial*\n"
+        "• `/plan` – Generar plan financiero con IA\n\n"
+        "🆘 *Otros*\n"
         "• `/start` – Activar el bot\n"
-        "• `/menu` – Mostrar este menú de ayuda\n"
+        "• `/menu` – Ver este menú\n"
     )
-    await update.message.reply_text(mensaje, parse_mode="HTML")
 
-# --- MAIN ---
+    await update.message.reply_text(texto, parse_mode="Markdown")
 
+async def comando_edc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text
+
+    # 1️⃣ Validar tarjeta
+    partes = texto.split()
+    if len(partes) < 2:
+        await update.message.reply_text(
+            "Uso correcto:\n/edc bbva"
+        )
+        return
+
+    tarjeta = partes[1].lower()
+    if tarjeta != "bbva":
+        await update.message.reply_text(
+            "Por ahora solo se soporta BBVA."
+        )
+        return
+
+    # 2️⃣ Parsear datos del mensaje
+    try:
+        datos = parsear_edc_texto(texto)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        return
+
+    # 3️⃣ Completar datos que el usuario NO escribe
+    fecha_corte = fecha_ultimo_corte_bbva()
+    techo_bbva = 4500
+
+    # 4️⃣ Registrar EDC
+    registrar_edc(
+        tarjeta="bbva",
+        fecha_corte=str(fecha_corte),
+        pago_no_intereses=datos["pago_no_intereses"],
+        cargos_msi=datos["cargos_msi"],
+        pago_minimo=datos["pago_minimo"],
+        techo_bbva=techo_bbva
+    )
+
+    # 5️⃣ Confirmar al usuario
+    await update.message.reply_text(
+        f"✅ Estado de cuenta BBVA registrado\n"
+        f"📅 Corte: {fecha_corte}\n"
+        f"💳 Pago sin intereses: ${datos['pago_no_intereses']:.2f}"
+    )
+
+# ▶️ MAIN (UNO SOLO)
 def main():
     init_csv()
+
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Registrar comandos
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("gasto", gasto))
     app.add_handler(CommandHandler("ingreso", ingreso))
+    app.add_handler(CommandHandler("gasto", gasto))
     app.add_handler(CommandHandler("pago", pago))
     app.add_handler(CommandHandler("resumen", resumen))
-    app.add_handler(CommandHandler("consejo", consejo))
-    app.add_handler(CommandHandler("movimientos", listar_movimientos))
+    app.add_handler(CommandHandler("movimientos", movimientos))
     app.add_handler(CommandHandler("borrar", borrar))
+    app.add_handler(CommandHandler("plan", plan))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("edc", comando_edc))
 
 
-    print("Bot iniciado...")
+
+
+    print("🤖 Bot financiero activo...")
     app.run_polling()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
